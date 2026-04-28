@@ -4,3 +4,4 @@ index.html
 *.duckdb
 *.duckdb.wal
 .mcp.json
+challenges.md
