@@ -1,0 +1,174 @@
+name: going-fishing
+
+x-common: &common
+  image: going-fishing:latest
+  networks:
+    - net
+  environment: &env
+    VGW_ACCESS_KEY: demo
+    VGW_SECRET_KEY: demoSecret
+    VGW_ENDPOINT:   versitygw:9000
+    S3_BUCKET:      iot-lake
+    DUCKLAKE_CATALOG:   data/catalog.db
+    DUCKLAKE_DATA_PATH: s3://iot-lake/data/
+    INGEST_INTERVAL: "5"
+  volumes:
+    - data:/app/data
+
+services:
+
+  # ── local S3 storage (official VersityGW image) ─────────────────────────────
+  # ./data/s3 and ./data/iam are created by `make up` before containers start.
+  versitygw:
+    image: ghcr.io/versity/versitygw:v1.4.0
+    networks:
+      - net
+    command:
+      - --port=:9000
+      - --iam-dir=/data/iam
+      - posix
+      - /data/s3
+    environment:
+      ROOT_ACCESS_KEY: demo
+      ROOT_SECRET_KEY: demoSecret
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./data/s3:/data/s3
+      - ./data/iam:/data/iam
+
+  # ── streaming source → ring buffer ──────────────────────────────────────────
+  ringbuffer:
+    <<: *common
+    command:
+      - sh
+      - -c
+      - |
+        { echo "pid,cpu,mem,rss,comm"
+          while true; do
+            ps -eo pid,pcpu,pmem,rss,comm --no-headers \
+              | awk '{printf "%s,%.1f,%.1f,%s,%s\n",$$1,$$2,$$3,$$4,$$5}'
+            sleep 1
+          done
+        } | ringbuffer --addr :9001
+    ports:
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9001/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  # ── one-shot setup: bucket + DuckLake table ─────────────────────────────────
+  setup:
+    <<: *common
+    command:
+      - sh
+      - -c
+      - |
+        until curl -s http://versitygw:9000/ >/dev/null 2>&1; do
+          echo "waiting for versitygw..."; sleep 2
+        done
+        mc alias set vgw http://versitygw:9000 demo demoSecret --api S3v4
+        mc mb vgw/$${S3_BUCKET} --ignore-existing
+        duckdb --init .duckdbrc :memory: <<SQL
+          ATTACH IF NOT EXISTS 'ducklake:data/catalog.db' AS lake (
+              DATA_PATH 's3://iot-lake/data/'
+          );
+          CREATE TABLE IF NOT EXISTS lake.events (
+              ts   TIMESTAMPTZ,
+              pid  INTEGER,
+              cpu  DOUBLE,
+              mem  DOUBLE,
+              rss  INTEGER,
+              comm VARCHAR
+          );
+        SQL
+    restart: "no"
+
+  # ── 5-second CSV ingestion loop (default) ───────────────────────────────────
+  ingest:
+    <<: *common
+    environment:
+      <<: *env
+      RINGBUFFER_URL: http://ringbuffer:9001
+    command: ["./ingest.sh", "data/session.db"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      ringbuffer:
+        condition: service_healthy
+    restart: on-failure
+
+  # ── periodic DuckLake compaction (every 5 min, keeps 1 h of time travel) ───
+  compact:
+    <<: *common
+    command: ["./compact.sh"]
+    environment:
+      <<: *env
+      COMPACT_INTERVAL: "300"
+      TIME_TRAVEL_WINDOW: "1 hour"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  # ── REST / MCP API over DuckLake (caddy-duckdb-module) ─────────────────────
+  pequod:
+    image: ghcr.io/mskyttner/caddy-duckdb-module
+    networks:
+      - net
+    ports:
+      - "8099:8080"
+    volumes:
+      - data:/data                              # catalog.db lives here
+      - ./pequod-init.sql:/pequod/init.sql:ro
+      - ./data/auth:/pequod/auth                # pre-initialized auth.db (directory mount for WAL)
+      - ./data/duck-extensions/ducklake.duckdb_extension:/home/caddy/.duckdb/extensions/v1.5.2/linux_amd64/ducklake.duckdb_extension:ro
+      - ./data/duck-extensions/ducklake.duckdb_extension.info:/home/caddy/.duckdb/extensions/v1.5.2/linux_amd64/ducklake.duckdb_extension.info:ro
+    environment:
+      TZ: UTC
+      DUCKDB_DATABASE_PATH: ":memory:"
+      DUCKDB_INIT_FILE: /pequod/init.sql
+      DUCKDB_AUTH_DATABASE_PATH: /pequod/auth/auth.db
+      DUCKDB_ACCESS_MODE: read_write
+      DUCKDB_QUERY_TIMEOUT: 30s
+      DUCKDB_THREADS: "2"
+      DUCKDB_MAX_ROWS_PER_PAGE: "200"
+      DUCKDB_ABSOLUTE_MAX_ROWS: "10000"
+      DUCKDB_CORS_ORIGINS: "*"
+      XDG_DATA_HOME: /tmp
+      XDG_CONFIG_HOME: /tmp
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/duckdb/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # ── Arc: optional high-throughput alternative hot tier ──────────────────────
+  arc:
+    image: ghcr.io/basekick-labs/arc:latest
+    networks:
+      - net
+    volumes:
+      - ./arc.toml:/app/arc.toml:ro
+    environment:
+      ARC_STORAGE_S3_ENDPOINT:   versitygw:9000
+      ARC_STORAGE_S3_ACCESS_KEY: demo
+      ARC_STORAGE_S3_SECRET_KEY: demoSecret
+      ARC_STORAGE_S3_BUCKET:     arc-stream
+    ports:
+      - "8000:8000"
+    depends_on:
+      - versitygw
+    profiles:
+      - arc                        # opt-in: podman-compose --profile arc up
+
+volumes:
+  data:
+
+networks:
+  net:
+    driver: bridge

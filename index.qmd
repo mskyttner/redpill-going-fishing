@@ -1,0 +1,635 @@
+---
+title: "Gone Fishing at DuckLake"
+subtitle: "shellfs · Go ring buffer · DuckLake · VersityGW · Arc · pequod REST API"
+author:
+  firstname: Markus
+  lastname: Skyttner
+  address: "Stockholm, Sverige"
+  contacts:
+    - icon: fa envelope
+      text: markus.skyttner@redpill-linpro.com
+      url: "mailto:markus.skyttner@redpill-linpro.com"
+company-logo: redpill-linpro-logo.png
+header-wave: redpill-linpro-wave.png
+style:
+  color-accent: "f03239"
+  font-header: "Lato"
+  font-text: "Lato"
+format:
+  revealjs:
+    brand: _brand.yml
+    embed-resources: true
+    smooth-scroll: true
+    toc: false
+    logo: redpill-linpro-logo.png
+title-slide-attributes:
+  data-background-image: ff.jpeg
+  data-background-size: cover
+  data-background-opacity: "0.4"
+---
+
+# Three Scripts — From `ps` to Sparkline
+
+## Unix pipeline philosophy — one job each {.smaller}
+
+> **Each script does exactly one thing and knows nothing about its neighbours.**
+
+```
+ps_arrow.sql          ingest-ps-arrow.sh          sparkline.sql
+─────────────         ──────────────────          ─────────────
+typed producer    →   transport bridge        →   lake consumer
+                  │                           │
+           Arrow IPC bytes              DuckLake events
+           on stdout                    (any writer, any time)
+```
+
+| Role | Script | Knows about |
+|------|--------|-------------|
+| **Typed producer** | `ps_arrow.sql` | `ps` output format, Arrow IPC |
+| **Transport bridge** | `ingest-ps-arrow.sh` | stdin bytes, DuckLake schema |
+| **Lake consumer** | `sparkline.sql` | `events` table, textplot |
+
+Each stage is independently runnable and replaceable:
+
+- Swap `ps` for `vmstat` — only the producer changes
+- Swap Arrow IPC for CSV — only the bridge changes
+- Swap sparklines for a bar chart — only the consumer changes
+
+The lake is the **contract** — a stable table that decouples how data arrives from how it is analysed.
+
+## Step 1 — Capture: typed Arrow stream from `ps` {.smaller}
+
+`ps_arrow.sql` — reads live process metrics via `shellfs`, creates a typed view, writes Arrow IPC to stdout:
+
+```sql
+-- ps_arrow.sql
+LOAD shellfs;
+LOAD arrow;
+
+CREATE OR REPLACE VIEW ps_snapshot AS
+WITH lines AS (
+    SELECT unnest(string_split(content, E'\n')) AS line
+    FROM read_text('ps -eo pid,pcpu,pmem,rss,comm --no-headers |')
+),
+fields AS (
+    SELECT string_split_regex(trim(line), '\s+') AS f
+    FROM lines WHERE trim(line) != ''
+)
+SELECT NOW() AS ts, f[1]::INTEGER AS pid, f[2]::DOUBLE AS cpu,
+       f[3]::DOUBLE AS mem, f[4]::INTEGER AS rss, f[5] AS comm
+FROM fields WHERE len(f) >= 5;
+
+COPY (SELECT * FROM ps_snapshot) TO '/dev/stdout' (FORMAT ARROW);
+```
+
+```bash
+duckdb --init .duckdbrc :memory: < ps_arrow.sql 2>/dev/null
+# → binary Arrow IPC stream on stdout, schema enforced, ready to pipe
+```
+
+## Step 2 — Ingest: Arrow stream into DuckLake {.smaller}
+
+`ingest-ps-arrow.sh` — pipes the Arrow stream into DuckLake via a second DuckDB process:
+
+```bash
+#!/usr/bin/env bash
+# ingest-ps-arrow.sh — one shot; wrap in a `while true; sleep 5; done` loop to poll
+
+duckdb --init .duckdbrc :memory: < ps_arrow.sql 2>/dev/null \
+  | duckdb --init .duckdbrc data/session.db \
+    -c "LOAD arrow;
+        SET ducklake_default_data_inlining_row_limit = 10000;
+        ATTACH IF NOT EXISTS 'ducklake:data/catalog.db' AS lake (
+            DATA_PATH 's3://iot-lake/data/'
+        );
+        CREATE TABLE IF NOT EXISTS lake.events (
+            ts TIMESTAMPTZ, pid INTEGER, cpu DOUBLE,
+            mem DOUBLE, rss INTEGER, comm VARCHAR
+        );
+        INSERT INTO lake.events SELECT * FROM read_arrow('cat - |');"
+```
+
+Two DuckDB processes: first enforces types and writes Arrow IPC bytes, second reads them from stdin via `read_arrow('cat - |')` and writes to the lake. SQL must be passed via `-c` so stdin carries Arrow bytes.
+
+## Step 3 — Analyse: CPU sparklines from the lake {.smaller}
+
+`sparkline.sql` — loads `textplot`, attaches the DuckLake catalog (read-only via `.duckdbrc`), renders per-process CPU trends:
+
+```sql
+-- sparkline.sql
+INSTALL textplot FROM community;
+LOAD textplot;
+
+WITH bucketed AS (
+    SELECT
+        comm,
+        time_bucket(INTERVAL '10 seconds', ts) AS bucket,
+        AVG(cpu)                                AS avg_cpu
+    FROM events
+    WHERE ts >= NOW() - INTERVAL '5 minutes'
+    GROUP BY comm, bucket
+),
+ranked AS (
+    SELECT
+        comm,
+        AVG(avg_cpu)                                        AS overall_cpu,
+        tp_sparkline(list(avg_cpu ORDER BY bucket),
+                     width := 40,
+                     mode  := 'absolute',
+                     theme := 'utf8_blocks')                AS cpu_trend
+    FROM bucketed
+    GROUP BY comm
+    HAVING COUNT(*) >= 2
+)
+SELECT printf('%-20s', comm) AS process,
+       round(overall_cpu, 2) AS avg_cpu,
+       cpu_trend
+FROM ranked
+ORDER BY overall_cpu DESC LIMIT 20;
+```
+
+```bash
+duckdb --init .duckdbrc :memory: < sparkline.sql
+# → process  avg_cpu  ▁▂▃▅▇▅▃▂▁▂▃▅▃▂▁▂▃▄▅▃▂▃▁▂▃▄▅▅▄▃▂▁▂▃▄▃▂▁
+```
+
+# The Challenge — Streaming into a Lakehouse
+
+## What do we actually want?
+
+> Take a **fast, continuous data source** — logs, IoT sensors, process metrics — and land it in a **versioned, queryable lakehouse** with time travel, without an orchestration cluster.
+
+Constraints for this demo:
+
+- **Single machine** — no Kafka, no Spark, no Kubernetes
+- **Open formats only** — Parquet on S3, Arrow IPC in the pipe
+- **Standard SQL** — DuckDB CLI throughout, no custom query language
+- **Local S3** — no cloud bill, no credentials to rotate
+
+The stack that fits: `shellfs` + a Go ring buffer + `DuckLake` + `VersityGW`
+
+## The components at a glance
+
+| Component | Role |
+|---|---|
+| **Linux command** (`ps`) | Data source — fast text stream |
+| **Go ring buffer** | Temporal buffer — absorbs bursts, drains on demand |
+| **DuckDB + `shellfs`** | Type gateway — enforces schema, writes to DuckLake |
+| **DuckLake** | Lakehouse catalog — ACID, time travel, schema evolution |
+| **VersityGW** | Local S3 — POSIX directory exposed as S3 API |
+| **compact.sh** | Periodic DuckLake compaction — merges Parquet, expires snapshots |
+| **pequod** | REST / MCP API — caddy-duckdb-module serving DuckLake data |
+| **Arc** | Alternative hot-tier — 18M+ rec/s via HTTP ingest |
+
+# The Storage Layer
+
+## VersityGW — local S3 in one command {.smaller}
+
+VersityGW translates S3 API calls to a local POSIX filesystem. No MinIO config, no Docker — one binary.
+
+```bash
+mkdir -p /tmp/lake-data /tmp/lake-iam
+
+ROOT_ACCESS_KEY=demo ROOT_SECRET_KEY=demoSecret \
+  versitygw --port :9000 --iam-dir /tmp/lake-iam posix /tmp/lake-data
+```
+
+```bash
+# Create the bucket (once)
+aws --endpoint-url http://localhost:9000 \
+    --no-verify-ssl s3 mb s3://iot-lake --region us-east-1
+```
+
+Any S3-aware tool now speaks to `/tmp/lake-data/` — including DuckDB's `httpfs` and DuckLake.
+
+- Apache-2.0 · Go · stateless (multiple instances → horizontal scale)
+- Backends: POSIX filesystem, ScoutFS, Azure Blob, S3 proxy
+- [github.com/versity/versitygw](https://github.com/versity/versitygw)
+
+## DuckLake — catalog-first lakehouse on DuckDB 1.5.2 {.smaller}
+
+:::: {.columns}
+::: {.column width="60%"}
+DuckLake separates **catalog** (a local DuckDB file) from **data** (Parquet files in S3).
+
+```sql
+-- .duckdbrc — loaded automatically by duckdb --init
+INSTALL ducklake FROM core;
+INSTALL httpfs   FROM core;
+LOAD ducklake;
+LOAD httpfs;
+
+CREATE OR REPLACE SECRET versity_s3 (
+  TYPE S3,
+  KEY_ID 'demo', SECRET 'demoSecret',
+  ENDPOINT 'host.containers.internal:9000',
+  URL_STYLE 'path', USE_SSL false,
+  REGION 'us-east-1'
+);
+```
+
+```sql
+-- Attach catalog (local DuckDB file) → data lives in S3
+ATTACH 'ducklake:data/catalog.db' AS lake (
+    DATA_PATH 's3://iot-lake/data/'
+);
+
+CREATE TABLE lake.events (
+  ts TIMESTAMPTZ, pid INTEGER,
+  cpu DOUBLE, mem DOUBLE,
+  rss INTEGER, comm VARCHAR
+);
+```
+:::
+::: {.column width="40%"}
+**What DuckLake gives you:**
+
+- ACID transactions on S3
+- **Time travel** — `AT (timestamp => ...)`
+- Schema evolution
+- Parquet compaction via `ducklake_merge_adjacent_files`
+- Any S3-compatible backend
+
+Every `INSERT` creates a new **snapshot** in the catalog — the foundation for time travel.
+
+**Inlining** — small batches stay in the catalog DuckDB file (no Parquet round-trip) until compaction flushes them:
+
+```sql
+SET ducklake_default_data_inlining_row_limit = 10000;
+```
+:::
+::::
+
+# The Pipeline
+
+## Architecture {.smaller}
+
+```
+[ps loop in container]
+        │ raw text lines (CSV)
+        ▼
+[Go ring buffer  :9001]
+  • absorbs bursts between 5-second DuckDB reads
+  • GET /drain  →  header + lines, atomic clear
+  • GET /health →  {"buffered":N,"capacity":10000}
+        │
+        │  every 5 seconds (ingest.sh)
+        ▼
+[duckdb  data/session.db]
+  LOAD shellfs; LOAD ducklake;
+  INSERT INTO lake.events
+  SELECT NOW(), pid, cpu, mem, rss, comm
+  FROM read_csv('curl -sf .../drain |', header=true, ...);
+        │                              every 5 min (compact.sh)
+        ▼                              ┌──────────────────────┐
+[DuckLake catalog]                     │ ducklake_flush_inlined│
+[data/catalog.db]  ──Parquet files──▶  │ ducklake_merge_files  │
+                      [VersityGW :9000]│ ducklake_expire_snaps │
+                      ./data/s3/       └──────────────────────┘
+                            │
+                            ▼
+                   [pequod  :8099]
+                   caddy-duckdb REST/MCP API
+                   ATTACH ducklake (READ_ONLY) → SELECT * FROM events
+```
+
+The ring buffer is **type-agnostic** — it holds raw text lines and knows nothing about schemas. Type enforcement happens entirely at the DuckDB `read_csv` boundary via `columns={}`.
+
+## The Go ring buffer {.smaller}
+
+A fixed-capacity circular buffer over stdin — no Arrow, no JSON, just strings.
+
+```go
+type RingBuffer struct {
+    mu     sync.Mutex
+    buf    [10_000]string
+    head   int    // next write position
+    count  int    // valid entries
+    header string // first stdin line, kept as CSV header
+}
+
+func (r *RingBuffer) add(line string) {
+    r.mu.Lock(); defer r.mu.Unlock()
+    r.buf[r.head] = line
+    r.head = (r.head + 1) % capacity
+    if r.count < capacity { r.count++ }  // oldest silently overwritten when full
+}
+```
+
+`/drain` reconstructs ordered lines and clears atomically:
+
+```go
+func (r *RingBuffer) drain() string {
+    r.mu.Lock(); defer r.mu.Unlock()
+    start := (r.head - r.count + capacity) % capacity
+    // ... walk from start, join, reset head/count
+}
+```
+
+- **Fixed array** — no allocations on `add`, O(1) everywhere
+- **Atomic drain** — each record seen by DuckDB **exactly once** per 5-second tick
+- HTTP `/health` endpoint for observability
+
+## Connecting the source {.smaller}
+
+**`vmstat`** — truly streaming, emits one row per second, header printed once:
+
+```bash
+vmstat 1 \
+  | awk 'NR==1{next}
+         NR==2{print "ts,r,b,swpd,free,buff,cache,si,so,bi,bo,in,cs,us,sy,id,wa,st"; next}
+         {print strftime("%Y-%m-%dT%H:%M:%SZ") "," $0}' \
+  | ./bin/ringbuffer
+```
+
+**`ps`** loop — header emitted once before the loop, suppressed inside:
+
+```bash
+{
+  echo "pid,cpu,mem,rss,comm"
+  while true; do
+    ps -eo pid,pcpu,pmem,rss,comm --no-headers \
+      | awk '{printf "%s,%.1f,%.1f,%s,%s\n",$1,$2,$3,$4,$5}'
+    sleep 1
+  done
+} | ./bin/ringbuffer
+```
+
+Both work because the ring buffer reads **line 1 as the header**, everything else as data.
+
+## shellfs — shell commands as DuckDB file sources {.smaller}
+
+The `shellfs` community extension makes any command output a valid file path in DuckDB SQL.
+
+**Convention: trailing pipe character**
+
+```sql
+-- ✓ correct
+SELECT * FROM read_csv('curl -sf http://localhost:9001/drain |', header=true);
+
+-- ✗ wrong (this prefix does not exist)
+SELECT * FROM read_csv('shell:curl ...');
+```
+
+The ingestion loop — type-safe, one DuckDB call per tick:
+
+```bash
+while true; do
+  duckdb --init .duckdbrc data/session.db <<SQL
+    SET ducklake_default_data_inlining_row_limit = 10000;
+    ATTACH IF NOT EXISTS 'ducklake:data/catalog.db' AS lake (
+        DATA_PATH 's3://iot-lake/data/'
+    );
+    CREATE TABLE IF NOT EXISTS lake.events (
+        ts TIMESTAMPTZ, pid INTEGER, cpu DOUBLE,
+        mem DOUBLE, rss INTEGER, comm VARCHAR
+    );
+    INSERT INTO lake.events
+    SELECT NOW(), pid, cpu, mem, rss, comm FROM read_csv(
+      'curl -sf http://host.containers.internal:9001/drain |',
+      header = true,
+      columns = {
+        pid: 'INTEGER', cpu: 'DOUBLE',
+        mem: 'DOUBLE',  rss: 'INTEGER', comm: 'VARCHAR'
+      }
+    );
+SQL
+  sleep 5
+done
+```
+
+Extensions (`shellfs`, `ducklake`, `httpfs`) and the S3 secret are pre-loaded from `.duckdbrc` — no `INSTALL` inside the loop.
+
+## Arrow IPC variant — typed binary in the pipe {.smaller}
+
+The `arrow` community extension adds `FORMAT ARROW` to `COPY` and `read_arrow()` to shellfs.
+
+```bash
+# Verified on DuckDB v1.5.2:
+# COPY ... TO '/dev/stdout' (FORMAT ARROW)  → magic bytes FF FF FF FF ✓
+# read_arrow('cat file.arrows |')           → types preserved ✓
+```
+
+Two-DuckDB pipe — makes the Arrow IPC stream observable and separates type-validation from the lake write:
+
+```bash
+while true; do
+  duckdb :memory: "
+    INSTALL arrow FROM community; LOAD arrow;
+    INSTALL shellfs FROM community; LOAD shellfs;
+    COPY (
+      SELECT * FROM read_csv(
+        'curl -sf http://host.containers.internal:9001/drain |',
+        header=true, columns={pid:'INTEGER', cpu:'DOUBLE', ...})
+    ) TO '/dev/stdout' (FORMAT ARROW);
+  " 2>/dev/null \
+  | duckdb --init .duckdbrc data/session.db "
+    LOAD arrow;
+    INSERT INTO lake.events SELECT * FROM read_arrow('cat - |');
+  "
+  sleep 5
+done
+```
+
+Use the single-DuckDB form to start; add the pipe when you want Arrow IPC as an artifact or multiple sinks.
+
+# Time Travel & Arc
+
+## DuckLake time travel {.smaller}
+
+Every `INSERT INTO lake.events` creates a **snapshot** in the catalog. Query any past state:
+
+```sql
+-- Current state
+SELECT COUNT(*), AVG(cpu) FROM lake.events;
+
+-- State 10 minutes ago
+SELECT COUNT(*), AVG(cpu) FROM lake.events
+  AT (timestamp => NOW() - INTERVAL '10 minutes');
+
+-- Compare snapshots
+WITH now   AS (SELECT AVG(cpu) avg FROM lake.events),
+     then  AS (SELECT AVG(cpu) avg FROM lake.events
+                 AT (timestamp => NOW() - INTERVAL '1 hour'))
+SELECT now.avg - then.avg AS cpu_drift FROM now, then;
+```
+
+> **Arc writing Parquet directly to VersityGW does NOT give DuckLake time travel.**
+> Arc bypasses the DuckLake catalog — no snapshot is created, so `AT (timestamp => ...)` has nothing to walk.
+
+The fix: use Arc as a **hot tier** and the ingestion loop to copy from Arc's SQL API into DuckLake.
+
+## Arc — hot tier for high-throughput ingest {.smaller}
+
+:::: {.columns}
+::: {.column width="55%"}
+[Arc](https://github.com/Basekick-Labs/arc) is a Go binary built on DuckDB + Parquet + Arrow. Single binary, S3-native, 18M+ rec/s via MessagePack HTTP ingest.
+
+```toml
+# arc.toml — point at VersityGW
+[storage]
+backend       = "s3"
+s3_bucket     = "arc-stream"
+s3_endpoint   = "127.0.0.1:9000"
+s3_path_style = true
+s3_use_ssl    = false
+
+[ingest]
+max_buffer_age_ms = 5000  # flush every 5s
+```
+
+```bash
+# Generator pushes to Arc HTTP API
+go run generator/main.go \
+  | arc-send --url http://localhost:8000/ingest/iot/events
+```
+:::
+::: {.column width="45%"}
+**Two-tier pattern:**
+
+```
+[Generator]
+     │
+     ▼
+  [Arc :8000]          ← hot tier
+  18M+ rec/s            seconds to hours
+  Parquet → VersityGW
+     │
+     │ Arc SQL API
+     ▼
+  [DuckDB ingestion]   ← bridge
+  INSERT INTO lake      every N minutes
+     │
+     ▼
+  [DuckLake]           ← cold tier
+  full time travel      days to years
+```
+
+Arc handles the intake rate that would overwhelm a 5-second DuckDB loop at production scale.
+:::
+::::
+
+# Demo
+
+## Startup sequence
+
+Everything runs in containers via podman-compose:
+
+```bash
+make up        # builds image, creates data/s3 + data/iam, starts all services
+make logs      # tail all service logs
+make compact   # run compaction once on demand
+make down      # stop and remove containers (data preserved)
+```
+
+Services started by `make up`:
+
+| Service | Description |
+|---|---|
+| `versitygw` | Local S3 on `:9000` |
+| `ringbuffer` | Go ring buffer on `:9001`, streams `ps` output |
+| `setup` | One-shot: creates bucket + DuckLake table, then exits |
+| `ingest` | Drains ring buffer into DuckLake every 5 seconds |
+| `compact` | Compacts DuckLake every 5 minutes |
+| `pequod` | REST/MCP API on `:8099` (caddy-duckdb-module) |
+
+```bash
+# Optional Arc hot-tier (opt-in profile)
+make up-arc
+```
+
+## Querying the live lake {.smaller}
+
+**Direct DuckDB** (catalog attach, supports time travel):
+
+```sql
+-- data/session.db already has the secret and ducklake loaded via .duckdbrc
+ATTACH IF NOT EXISTS 'ducklake:data/catalog.db' AS lake (
+    DATA_PATH 's3://iot-lake/data/'
+);
+
+-- Rolling 30-second CPU load per process
+SELECT comm,
+  time_bucket(INTERVAL '30 seconds', ts) AS bucket,
+  AVG(cpu) AS avg_cpu, MAX(cpu) AS peak_cpu, COUNT(*) AS samples
+FROM lake.events
+WHERE ts > NOW() - INTERVAL '5 minutes'
+GROUP BY comm, bucket ORDER BY bucket DESC, avg_cpu DESC LIMIT 20;
+
+-- Time travel: CPU picture 2 minutes ago
+SELECT comm, AVG(cpu) avg_cpu
+FROM lake.events AT (timestamp => NOW() - INTERVAL '2 minutes')
+GROUP BY comm ORDER BY avg_cpu DESC LIMIT 10;
+```
+
+**Via pequod REST API** (DuckLake attached at startup, `search_path = 'lake,main'`):
+
+```bash
+# Regular query — events resolves via search_path
+curl -s http://localhost:8099/duckdb/query \
+  -H "X-API-Key: <admin-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT comm, AVG(cpu) avg_cpu FROM events
+       GROUP BY comm ORDER BY avg_cpu DESC LIMIT 10"}'
+
+# Time travel — AT syntax works through the REST API too
+curl -s http://localhost:8099/duckdb/query \
+  -H "X-API-Key: <admin-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT COUNT(*) FROM events AT (timestamp => NOW() - INTERVAL '"'"'5 minutes'"'"')"}'
+```
+
+> `{"sql": "..."}` is the required key — not `"query"`. Use `X-API-Key` header. ATTACH runs once in `pequod-init.sql` at connection creation (not per-request), so each query starts with `SELECT` and routes through the read path correctly.
+
+## Key findings — DuckDB v1.5.2
+
+- **shellfs**: trailing pipe `'cmd |'` — not `'shell:cmd'`
+- **Arrow IPC**: community extension — `INSTALL arrow FROM community`
+- **`COPY TO '/dev/stdout' (FORMAT ARROW)`** works once arrow is loaded
+- **`read_arrow('cmd |')`** works with shellfs — types survive the pipe
+- **`.arrows`** = IPC streaming format (self-framing per batch, pipe-safe)
+  **`.arrow`** = IPC file format (needs footer → not pipe-safe)
+- **DuckLake time travel** requires writes through the DuckLake catalog — Arc writing Parquet directly bypasses it
+- **DuckLake catalog is a local DuckDB file** — `ATTACH 'ducklake:data/catalog.db'`; data Parquet goes in S3
+- **DuckLake inlining**: default row limit is only 10 rows; set `ducklake_default_data_inlining_row_limit = 10000` before ATTACH to keep small batches in the catalog without Parquet overhead
+- **DuckLake in the Go driver**: `github.com/duckdb/duckdb-go/v2 v2.10502.0` embeds DuckDB 1.5.2 — same version as the CLI. Pre-mount the extension from your own image so `LOAD ducklake` works without a runtime download
+- **ATTACH in init, not per-request**: putting `ATTACH` in `DUCKDB_INIT_FILE` runs once at connection creation; each query then starts with `SELECT` and routes through the read path. `SET search_path = 'lake,main'` lets callers write `FROM events` without schema qualification
+- **Time travel works through the REST API**: `SELECT ... FROM events AT (timestamp => NOW() - INTERVAL '5 minutes')` — the `AT` clause is part of the `SELECT`, so it routes correctly
+- **pequod query format**: `{"sql": "..."}` — not `{"query": "..."}`. Auth header is `X-API-Key: <key>` — not `Authorization: Bearer`. Admin role required for arbitrary SQL
+- **podman 3.4.4 networking**: containers cannot resolve each other by hostname on the default bridge; use `host.containers.internal` (injected into every container's `/etc/hosts`) to reach port-mapped services on the host
+
+## Thanks!
+
+:::: {.columns}
+::: {.column width="50%"}
+**Repo**
+
+```
+redpill-going-fishing/
+├── ringbuffer/main.go      # Go ring buffer
+├── ps_arrow.sql            # typed Arrow stream from ps
+├── ingest-ps-arrow.sh      # pipe Arrow stream into DuckLake
+├── sparkline.sql           # CPU sparklines via textplot
+├── ingest.sh               # 5-second CSV DuckLake loop
+├── compact.sh              # DuckLake compaction loop
+├── pequod-init.sql         # REST API: DuckLake attach + search_path
+├── Containerfile           # multi-stage image build
+├── compose.yaml            # full stack definition
+├── Makefile                # up / down / compact / test
+└── index.qmd               # these slides
+```
+
+**Links**
+
+- [DuckLake](https://ducklake.select/)
+- [shellfs extension](https://github.com/rustyconover/duckdb-shellfs-extension)
+- [arrow extension](https://duckdb.org/2025/05/23/arrow-ipc-support-in-duckdb)
+- [VersityGW](https://github.com/versity/versitygw)
+- [Arc](https://github.com/Basekick-Labs/arc)
+- [textplot extension](https://github.com/query-farm/textplot)
+- [caddy-duckdb-module](https://github.com/mskyttner/caddy-duckdb-module)
+:::
+::: {.column width="50%"}
+![](redpill-linpro-logo.png){width="60%"}
+:::
+::::

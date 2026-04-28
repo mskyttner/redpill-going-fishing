@@ -1,0 +1,26 @@
+-- Project-local DuckDB init. Load with: duckdb --init .duckdbrc
+-- Extensions are installed once (cached), loaded every session.
+-- .mode trash around CREATE SECRET suppresses the "Success" table so that
+-- stdout stays clean when this file is used in a pipe (e.g. Arrow IPC producer).
+
+INSTALL httpfs   FROM core;
+INSTALL ducklake FROM core;
+INSTALL shellfs  FROM community;
+INSTALL arrow    FROM community;
+
+LOAD httpfs;
+LOAD ducklake;
+LOAD shellfs;
+LOAD arrow;
+
+.mode trash
+CREATE OR REPLACE SECRET versity_s3 (
+    TYPE      S3,
+    KEY_ID    'demo',
+    SECRET    'demoSecret',
+    ENDPOINT  '127.0.0.1:9000',
+    URL_STYLE 'path',
+    USE_SSL   false,
+    REGION    'us-east-1'
+);
+.mode duckbox

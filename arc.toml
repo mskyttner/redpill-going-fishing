@@ -1,0 +1,26 @@
+[server]
+port = 8000
+
+[log]
+level  = "info"
+format = "console"
+
+[database]
+enable_wal = true
+
+[storage]
+backend       = "s3"
+s3_bucket     = "arc-stream"
+s3_endpoint   = ""          # set via ARC_STORAGE_S3_ENDPOINT env var in compose
+s3_region     = "us-east-1"
+s3_use_ssl    = false
+s3_path_style = true
+
+[ingest]
+max_buffer_size   = 50000
+max_buffer_age_ms = 5000   # flush every 5s — matches demo ingestion cadence
+
+[compaction]
+enabled         = true
+hourly_enabled  = true
+hourly_schedule = "5 * * * *"

@@ -1,0 +1,36 @@
+meta:
+  name: Redpill Linpro
+  link: https://redpill-linpro.com
+
+logo: 
+  images: 
+    rp-logo: redpill-linpro-logo.png
+  small: rp-logo
+  medium: rp-logo
+  large: rp-logo  
+
+color:
+  palette:
+    red: "#f03239"
+    dark-gray: "#4d4d4d"
+    gray: "#666666"
+    white: "#ffffff"
+  foreground: dark-gray
+  background: white
+  primary: red
+  secondary: gray
+
+typography:
+  fonts:
+    - family: Lato
+      source: google
+  base:
+    family: Lato
+    size: 20pt
+    line-height: 1.4
+  headings:
+    family: Lato
+    weight: 700
+    color: red
+  link:
+    color: red
