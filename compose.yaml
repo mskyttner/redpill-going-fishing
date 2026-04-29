@@ -84,6 +84,8 @@ services:
               comm VARCHAR
           );
         SQL
+        chmod 666 data/catalog.db
+        chmod 777 data
     restart: "no"
 
   # ── 5-second CSV ingestion loop (default) ───────────────────────────────────
@@ -126,6 +128,8 @@ services:
       - ./data/auth:/pequod/auth                # pre-initialized auth.db (directory mount for WAL)
       - ./data/duck-extensions/ducklake.duckdb_extension:/home/caddy/.duckdb/extensions/v1.5.2/linux_amd64/ducklake.duckdb_extension:ro
       - ./data/duck-extensions/ducklake.duckdb_extension.info:/home/caddy/.duckdb/extensions/v1.5.2/linux_amd64/ducklake.duckdb_extension.info:ro
+      - ./data/duck-extensions/shellfs.duckdb_extension:/home/caddy/.duckdb/extensions/v1.5.2/linux_amd64/shellfs.duckdb_extension:ro
+      - ./data/duck-extensions/shellfs.duckdb_extension.info:/home/caddy/.duckdb/extensions/v1.5.2/linux_amd64/shellfs.duckdb_extension.info:ro
     environment:
       TZ: UTC
       DUCKDB_DATABASE_PATH: ":memory:"
