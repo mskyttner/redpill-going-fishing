@@ -28,11 +28,19 @@ title-slide-attributes:
   data-background-opacity: "0.4"
 ---
 
-# Three Scripts — From `ps` to Sparkline
+# Challenge
+
+> Use Claude Code to develop a demo which ingests a Data Streams into a Data Lake and supports LLM-based time series analysis over MCP against the data
+
+- A streaming data source is ingested into a DuckLake - "ps": use data about locally running processes on your host
+- Use https://github.com/mskyttner/caddy-duckdb-module for adding REST and MCP to the data lake, enabling others to ...
+- Use a .mcp.json to do LLM-supported time series analysis (using Claude Code)
+
+# TLDR / Show Me: From `ps` to Sparkline
 
 ## Unix pipeline philosophy — one job each {.smaller}
 
-> **Each script does exactly one thing and knows nothing about its neighbours.**
+> **Each step does exactly one thing and knows nothing about its neighbours.**
 
 ```
 ps_arrow.sql          ingest-ps-arrow.sh          sparkline.sql
@@ -43,7 +51,7 @@ typed producer    →   transport bridge        →   lake consumer
            on stdout                    (any writer, any time)
 ```
 
-| Role | Script | Knows about |
+| Role | Step | Knows about |
 |------|--------|-------------|
 | **Typed producer** | `ps_arrow.sql` | `ps` output format, Arrow IPC |
 | **Transport bridge** | `ingest-ps-arrow.sh` | stdin bytes, DuckLake schema |
@@ -52,7 +60,7 @@ typed producer    →   transport bridge        →   lake consumer
 Each stage is independently runnable and replaceable:
 
 - Swap `ps` for `vmstat` — only the producer changes
-- Swap Arrow IPC for CSV — only the bridge changes
+- Swap Arrow IPC for CSV or JSON — only the bridge changes
 - Swap sparklines for a bar chart — only the consumer changes
 
 The lake is the **contract** — a stable table that decouples how data arrives from how it is analysed.
@@ -153,20 +161,20 @@ duckdb --init .duckdbrc :memory: < sparkline.sql
 # → process  avg_cpu  ▁▂▃▅▇▅▃▂▁▂▃▅▃▂▁▂▃▄▅▃▂▃▁▂▃▄▅▅▄▃▂▁▂▃▄▃▂▁
 ```
 
-# The Challenge — Streaming into a Lakehouse
+# Streaming into a Data Lake
 
 ## What do we actually want?
 
 > Take a **fast, continuous data source** — logs, IoT sensors, process metrics — and land it in a **versioned, queryable lakehouse** with time travel, without an orchestration cluster.
 
-Constraints for this demo:
+Reduce complexity:
 
 - **Single machine** — no Kafka, no Spark, no Kubernetes
 - **Open formats only** — Parquet on S3, Arrow IPC in the pipe
-- **Standard SQL** — DuckDB CLI throughout, no custom query language
+- **SQL** — DuckDB SQL throughout
 - **Local S3** — no cloud bill, no credentials to rotate
 
-The stack that fits: `shellfs` + a Go ring buffer + `DuckLake` + `VersityGW`
+A stack that fits: duckdb + `shellfs` + a Go ring buffer + `DuckLake` for DataLake + `VersityGW` for S3 / object storage
 
 ## The components at a glance
 
